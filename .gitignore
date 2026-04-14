@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+venv/
+ENV/
+.vscode/
+.idea/
+.ipynb_checkpoints/
+data/ml-100k/
+static/*.html
+static/*.csv
+models/*.pkl
