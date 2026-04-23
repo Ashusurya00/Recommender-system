@@ -102,7 +102,36 @@ h1, h2, h3 { font-family: 'Playfair Display', serif; }
 </style>
 """, unsafe_allow_html=True)
 
+# ── API and Local Logic Config ────────────────────────────────────────────
 API_BASE = os.getenv("API_BASE", "http://localhost:8000")
+
+@st.cache_resource
+def get_local_models():
+    """Initialises models locally if the API is unreachable."""
+    try:
+        from data.data_loader import MovieLensLoader
+        from models.collaborative_filter import CollaborativeFilter
+        from models.content_based import ContentBasedFilter
+        from models.hybrid import HybridRecommender
+        
+        loader   = MovieLensLoader()
+        cf_model = CollaborativeFilter(loader.ratings, n_factors=50)
+        cb_model = ContentBasedFilter(loader.movies, loader.ratings)
+        hybrid   = HybridRecommender(cf_model, cb_model, loader.movies)
+        return loader, cf_model, cb_model, hybrid
+    except Exception as e:
+        return None, None, None, None
+
+# Try to connect to API, otherwise use local logic
+def is_api_available():
+    try:
+        response = requests.get(f"{API_BASE}/health", timeout=2)
+        return response.status_code == 200
+    except:
+        return False
+
+API_AVAILABLE = is_api_available()
+LOADER, CF, CB, HYBRID = (None, None, None, None) if API_AVAILABLE else get_local_models()
 
 GENRES = [
     "action","adventure","animation","children","comedy","crime",
@@ -110,9 +139,93 @@ GENRES = [
     "mystery","romance","sci_fi","thriller","war","western",
 ]
 
+def _enrich_recs(recs):
+    """Local helper to add movie metadata (mimics API enrichment)."""
+    if LOADER is None: return []
+    movies = LOADER.movies.set_index("item_id")
+    rows = []
+    for _, row in recs.iterrows():
+        iid = int(row["item_id"])
+        meta = movies.loc[iid] if iid in movies.index else {}
+        rows.append({
+            "item_id": iid,
+            "title":  str(meta.get("title", "Unknown")),
+            "genres": str(meta.get("genres", "")),
+            "year":   int(meta.get("year", 0)) if pd.notna(meta.get("year", None)) else None,
+            "score":  round(float(row.get("score") or row.get("hybrid_score", 0)), 4),
+        })
+    return rows
+
+def handle_local_request(path: str, params: dict = None, method: str = "GET", payload: dict = None):
+    """Mimics API endpoints using local model instances."""
+    if LOADER is None:
+        st.error("Models not loaded locally. Is the API running?")
+        return None
+        
+    try:
+        if path.startswith("/recommend/"):
+            parts = path.split("/")
+            uid = int(parts[2])
+            top_k = int(params.get("top_k", 10))
+            alg = params.get("method", "svd")
+            
+            if len(parts) > 3 and parts[3] == "cf":
+                if alg == "user_user": recs = CF.recommend_user_user(uid, top_k)
+                elif alg == "item_item": recs = CF.recommend_item_item(uid, top_k)
+                else: recs = CF.recommend_svd(uid, top_k)
+                return {"recommendations": _enrich_recs(recs)}
+            elif len(parts) > 3 and parts[3] == "cb":
+                recs = CB.recommend(uid, top_k)
+                return {"recommendations": _enrich_recs(recs)}
+            else:
+                recs = HYBRID.recommend(uid, top_k=top_k, method=alg)
+                return {"recommendations": _enrich_recs(recs)}
+                
+        elif path.startswith("/movies/"):
+            iid = int(path.split("/")[-1])
+            movies = LOADER.movies.set_index("item_id")
+            if iid not in movies.index: return None
+            m = movies.loc[iid]
+            return {"title": m['title'], "genres": m['genres'], "year": m.get('year')}
+            
+        elif path.startswith("/similar/items/"):
+            iid = int(path.split("/")[-1])
+            top_k = int(params.get("top_k", 10))
+            recs = CF.get_similar_items(iid, top_k)
+            movies = LOADER.movies.set_index("item_id")
+            rows = []
+            for _, row in recs.iterrows():
+                miid = int(row["item_id"])
+                meta = movies.loc[miid] if miid in movies.index else {}
+                rows.append({"item_id": miid, "title": str(meta.get("title")), "genres": str(meta.get("genres")), "similarity": round(float(row["similarity"]), 4)})
+            return {"similar_items": rows}
+            
+        elif path.startswith("/similar/users/"):
+            uid = int(path.split("/")[-1])
+            top_k = int(params.get("top_k", 10))
+            recs = CF.get_similar_users(uid, top_k)
+            return {"similar_users": recs.to_dict(orient="records")}
+            
+        elif path == "/eda/summary":
+            return LOADER.eda_summary()
+            
+        elif path == "/cold-start":
+            recs = CB.cold_start_recommend(payload["genres"], top_k=payload.get("top_k", 10))
+            return {"recommendations": _enrich_recs(recs)}
+            
+        elif path.startswith("/explain/"):
+            parts = path.split("/")
+            return HYBRID.explain_recommendation(int(parts[2]), int(parts[3]))
+            
+    except Exception as e:
+        st.error(f"Local logic error: {e}")
+    return None
+
 # ── Helpers ───────────────────────────────────────────────────────────────
 
 def api_get(path: str, params: dict = None):
+    if not API_AVAILABLE:
+        return handle_local_request(path, params=params)
     try:
         r = requests.get(f"{API_BASE}{path}", params=params, timeout=30)
         r.raise_for_status()
@@ -123,6 +236,8 @@ def api_get(path: str, params: dict = None):
 
 
 def api_post(path: str, payload: dict):
+    if not API_AVAILABLE:
+        return handle_local_request(path, method="POST", payload=payload)
     try:
         r = requests.post(f"{API_BASE}{path}", json=payload, timeout=30)
         r.raise_for_status()
